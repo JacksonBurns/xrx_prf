@@ -2,15 +2,22 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from astartes.molecules import train_test_split
+from astartes.molecules import train_test_split_molecules
 import numpy as np
 import pandas as pd
 import joblib
 import matplotlib
+import optuna
+from sklearn.metrics import root_mean_squared_error
 
 matplotlib.use("Agg")
 
-from common import get_prf_pipe, PreviousModelTransformer, parity_plot, clean_smiles
+from common import (
+    get_prf_pipe,
+    PreviousModelTransformer,
+    parity_plot,
+    clean_smiles,
+)
 
 
 # these are in a specific order of which will be used to predict the others
@@ -26,6 +33,55 @@ TARGETS = [
     "MBPB",
 ]
 SMILES_COL = "SMILES"
+
+TUNING_MAX_SAMPLES = 1000  # limit number of samples for hyperparameter tuning for speed
+TUNING_TRIALS = 64  # number of optuna trials for hyperparameter tuning
+
+
+def define_by_run(trial):
+    return dict(
+        morgan_radius=trial.suggest_categorical("morgan_radius", [2, 3, 4]),
+        stack_chemprop=trial.suggest_categorical("stack_chemprop", [True, False]),
+        stack_xgb=trial.suggest_categorical("stack_xgb", [True, False]),
+        stack_knn=trial.suggest_categorical("stack_knn", [True, False]),
+        stack_elasticnet=trial.suggest_categorical("stack_elasticnet", [True, False]),
+        stack_svr=trial.suggest_categorical("stack_svr", [True, False]),
+        final_estimator=trial.suggest_categorical("final_estimator", ["elasticnet", "hgb", "rf"]),
+        global_target_scaling=trial.suggest_categorical("global_target_scaling", [True, False]),
+    )
+
+
+def train_one(
+    df,
+    train_idxs,
+    val_idxs,
+    target,
+    subdir,
+    extra_transformers,
+    write_output=False,
+    **kwargs,
+):
+    pipe = get_prf_pipe(
+        extra_transformers=extra_transformers,
+        **kwargs,
+    )
+    pipe.fit(df[SMILES_COL].iloc[train_idxs], df[target].iloc[train_idxs])
+    val_pred = pipe.predict(df[SMILES_COL].iloc[val_idxs])
+    data = {"smiles": df[SMILES_COL].iloc[val_idxs].reset_index(drop=True)}
+    data[f"true_{target}"] = df[target].iloc[val_idxs].reset_index(drop=True)
+    data[f"pred_{target}"] = val_pred
+    val_df = pd.DataFrame(data)
+    if write_output:
+        val_df.to_csv(Path(subdir) / "val_predictions.csv", index=False)
+        joblib.dump(pipe, subdir / "validation_model.joblib")
+        fig = parity_plot(
+            val_df[f"true_{target}"],
+            val_df[f"pred_{target}"],
+            quantity=target,
+        )
+        fig.savefig(subdir / "validation_parity.png", dpi=300)
+    return root_mean_squared_error(val_df[f"true_{target}"], val_df[f"pred_{target}"])
+
 
 if __name__ == "__main__":
     try:
@@ -43,9 +99,7 @@ if __name__ == "__main__":
     if data_cache_f.exists():
         _df = pd.read_csv(data_cache_f)
     else:
-        _df = pd.read_csv(
-            "hf://datasets/openadmet/openadmet-expansionrx-challenge-train-data/expansion_data_train_raw.csv"
-        )
+        _df = pd.read_csv("hf://datasets/openadmet/openadmet-expansionrx-challenge-train-data/expansion_data_train_raw.csv")
         _df.to_csv(data_cache_f, index=False)
 
     _df[SMILES_COL] = _df[SMILES_COL].map(clean_smiles)
@@ -66,7 +120,7 @@ if __name__ == "__main__":
                 df[target] = np.log10(df[_target])
         else:
             target = _target
-        
+
         # just in case
         df[target] = df[target].replace([np.inf, -np.inf], np.nan)
         df = df.dropna(subset=[target])
@@ -74,8 +128,17 @@ if __name__ == "__main__":
         subdir = outdir / target.replace(" ", "_")
         subdir.mkdir(parents=True, exist_ok=True)
 
-        # split and fit
-        *_, train_idxs, val_idxs = train_test_split(
+        extra_transformers = []
+        if previous_model_paths:
+            extra_transformers += [
+                (
+                    "previous_models",
+                    PreviousModelTransformer(previous_model_paths, outdir / "cache.db"),
+                )
+            ]
+
+        # start by hyperparameter optimizing the model
+        *_, train_idxs, val_idxs = train_test_split_molecules(
             df[SMILES_COL].to_numpy(),
             train_size=0.8,
             test_size=0.2,
@@ -83,29 +146,39 @@ if __name__ == "__main__":
             sampler="random",  # can change this to possibly improve performance
             return_indices=True,
         )
-        if previous_model_paths:
-            extra_transformers = [
-                ("previous_models", PreviousModelTransformer(previous_model_paths, outdir / "cache.db"))
-            ]
-        else:
-            extra_transformers = []
-        pipe = get_prf_pipe(extra_transformers=extra_transformers)
-        pipe.fit(df[SMILES_COL].iloc[train_idxs], df[target].iloc[train_idxs])
-        val_pred = pipe.predict(df[SMILES_COL].iloc[val_idxs])
-
-        # saving of predictions and model
-        data = {"smiles": df[SMILES_COL].iloc[val_idxs].reset_index(drop=True)}
-        data[f"true_{target}"] = df[target].iloc[val_idxs].reset_index(drop=True)
-        data[f"pred_{target}"] = val_pred
-        pd.DataFrame(data).to_csv(Path(subdir) / "val_predictions.csv", index=False)
-        out_model = subdir / "model.joblib"
-        joblib.dump(pipe, out_model)
-        previous_model_paths.append(out_model)
-
-        val_df = pd.read_csv(subdir / "val_predictions.csv")
-        fig = parity_plot(
-            val_df[f"true_{target}"],
-            val_df[f"pred_{target}"],
-            quantity=target,
+        study = optuna.create_study(direction="minimize")
+        study.optimize(
+            lambda trial: train_one(
+                df,
+                train_idxs,
+                val_idxs,
+                target,
+                subdir,
+                extra_transformers,
+                write_output=False,
+                **define_by_run(trial),
+            ),
+            n_trials=TUNING_TRIALS,
         )
-        fig.savefig(subdir / "validation_parity.png", dpi=300)
+        with open(subdir / f"optuna_study_{target.replace(' ', '_')}.txt", "w") as f:
+            f.write(f"Best hyperparameters for target {target}: {study.best_params}\n")
+        study.trials_dataframe().to_csv(subdir / f"optuna_study_results_{target.replace(' ', '_')}.csv")
+
+        # for reference, train and save the validation model with the optimal settings
+        train_one(
+            df,
+            train_idxs,
+            val_idxs,
+            target,
+            subdir,
+            extra_transformers,
+            write_output=True,
+            **study.best_params,
+        )
+
+        # using the optimal settings, train a model on the entire dataset for actual submission
+        pipe = get_prf_pipe(extra_transformers=extra_transformers, random_seed=42, **study.best_params)
+        pipe.fit(df[SMILES_COL], df[target])
+        outmodel = subdir / "final_model.joblib"
+        joblib.dump(pipe, outmodel)
+        previous_model_paths.append(outmodel)

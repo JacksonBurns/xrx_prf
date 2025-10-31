@@ -14,13 +14,15 @@ from scikit_mol.descriptors import MolecularDescriptorTransformer
 from scikit_mol.fingerprints import MorganFingerprintTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.linear_model import ElasticNet
 from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.preprocessing import QuantileTransformer
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
+from sklearn.pipeline import make_pipeline
 from sklearn.compose import TransformedTargetRegressor
-from sklearn.ensemble import StackingRegressor
+from sklearn.ensemble import StackingRegressor, HistGradientBoostingRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.neural_network import MLPRegressor
-from xgboost import XGBRegressor, XGBRFRegressor
+from sklearn.neighbors import KNeighborsRegressor
+from xgboost import XGBRegressor
 from scipy.stats import pearsonr
 from sklearn.metrics import (
     mean_absolute_error,
@@ -29,6 +31,147 @@ from sklearn.metrics import (
 )
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
+from sklearn.svm import SVR
+from sklearn.base import clone
+
+from argparse import ArgumentParser, Namespace
+from datetime import datetime
+import logging
+import os
+from os import PathLike
+from pathlib import Path
+from typing import List, Literal, Optional, Sequence
+
+from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks import EarlyStopping, StochasticWeightAveraging
+import numpy as np
+from sklearn.base import BaseEstimator, RegressorMixin, TransformerMixin
+from sklearn.metrics import (
+    accuracy_score,
+    mean_absolute_error,
+    r2_score,
+    root_mean_squared_error,
+)
+import torch
+from torch.utils.data import DataLoader
+
+from chemprop.cli.common import add_common_args, find_models
+from chemprop.cli.train import add_train_args, build_model, normalize_inputs
+from chemprop.cli.utils.parsing import make_datapoints, make_dataset, parse_csv
+from chemprop.data.collate import (
+    collate_batch,
+    collate_mol_atom_bond_batch,
+    collate_multicomponent,
+)
+from chemprop.data.datasets import MolAtomBondDataset, MulticomponentDataset
+from chemprop.featurizers.molgraph.reaction import RxnMode
+from chemprop.models import MPNN, MulticomponentMPNN, utils
+from chemprop.nn.transforms import UnscaleTransform
+from chemprop.data.datapoints import make_mol, MoleculeDatapoint
+from sklearn.metrics import make_scorer, mean_absolute_error
+import numpy as np
+
+
+NOW = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+CHEMPROP_TRAIN_DIR = Path(os.getenv("CHEMPROP_TRAIN_DIR", "chemprop_training"))
+
+
+def add_train_defaults(args: Namespace) -> Namespace:
+    parser = ArgumentParser()
+    parser = add_common_args(parser)
+    parser = add_train_args(parser)
+    defaults = parser.parse_args([])
+    for k, v in vars(defaults).items():
+        if not hasattr(args, k):
+            setattr(args, k, v)
+    return args
+
+
+class ChemeleonRegressor(RegressorMixin, BaseEstimator):
+    def __init__(
+        self,
+        num_workers: int = 0,
+        batch_size: int = 64,
+        output_dir: Optional[PathLike] = CHEMPROP_TRAIN_DIR / "sklearn_output" / NOW,
+        ffn_hidden_dim: int = 2_048,
+        ffn_num_layers: int = 1,
+        accelerator: str = "auto",
+        devices: str | int | Sequence[int] = "auto",
+        epochs: int = 20,
+    ):
+        args = Namespace(
+            num_workers=num_workers,
+            batch_size=batch_size,
+            output_dir=output_dir,
+            ffn_hidden_dim=ffn_hidden_dim,
+            ffn_num_layers=ffn_num_layers,
+            accelerator=accelerator,
+            devices=devices,
+            epochs=epochs,
+            from_foundation="chemeleon",
+        )
+        self.args = add_train_defaults(args)
+        self.model = None
+        for name, value in locals().items():
+            if name not in {"self", "args"}:
+                setattr(self, name, value)
+
+    def _build_dps(
+        self,
+        X: np.ndarray[Chem.Mol],
+        Y: np.ndarray | None,
+    ):
+        if Y is None:
+            return [MoleculeDatapoint(mol=mol) for mol in X.flatten()]
+        return [MoleculeDatapoint(mol=mol, y=[target]) for mol, target in zip(X.flatten(), Y)]
+
+    def __sklearn_is_fitted__(self):
+        return True
+
+    def transform(self, X):
+        return self.predict(X)
+
+    def fit(self, X, y):
+        datapoints = self._build_dps(X, y)
+        train_set = make_dataset(datapoints)
+        if self.model is None:
+            output_scaler = train_set.normalize_targets()
+            output_transform = UnscaleTransform.from_standard_scaler(output_scaler)
+            self.model = build_model(self.args, train_set, output_transform, [None] * 4)
+        train_loader = DataLoader(
+            train_set,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            collate_fn=collate_batch,
+        )
+        trainer = Trainer(
+            accelerator=self.args.accelerator,
+            devices=self.args.devices,
+            max_epochs=self.args.epochs,
+            callbacks=[StochasticWeightAveraging(0.001, annealing_epochs=4, swa_epoch_start=0.6)],
+        )
+        trainer.fit(self.model, train_dataloaders=train_loader)
+        return self
+
+    def predict(self, X):
+        datapoints = self._build_dps(X, None)
+        test_set = make_dataset(datapoints)
+        self._y = test_set.Y
+        dl = DataLoader(
+            test_set,
+            batch_size=self.args.batch_size,
+            num_workers=self.args.num_workers,
+            collate_fn=collate_batch,
+        )
+        eval_trainer = Trainer(
+            accelerator=self.args.accelerator,
+            devices=1,
+            enable_progress_bar=True,
+            logger=False,
+        )
+        preds = eval_trainer.predict(self.model, dataloaders=dl, return_predictions=True)
+        return torch.cat(preds, dim=0).numpy(force=True).reshape(-1, 1)
 
 
 def clean_smiles(
@@ -62,9 +205,7 @@ def clean_smiles(
             remover = SaltRemover()  # use default saltremover
             mol = remover.StripMol(mol)  # strip salts
 
-        pattern = Chem.MolFromSmarts(
-            "[+1!h0!$([*]~[-1,-2,-3,-4]),-1!$([*]~[+1,+2,+3,+4])]"
-        )
+        pattern = Chem.MolFromSmarts("[+1!h0!$([*]~[-1,-2,-3,-4]),-1!$([*]~[+1,+2,+3,+4])]")
         at_matches = mol.GetSubstructMatches(pattern)
         at_matches_list = [y[0] for y in at_matches]
         if len(at_matches_list) > 0:
@@ -75,9 +216,7 @@ def clean_smiles(
                 atom.SetFormalCharge(0)
                 atom.SetNumExplicitHs(hcount - chg)
                 atom.UpdatePropertyCache()
-        out_smi = Chem.MolToSmiles(
-            mol, kekuleSmiles=True
-        )  # this also canonicalizes the input
+        out_smi = Chem.MolToSmiles(mol, kekuleSmiles=True)  # this also canonicalizes the input
         assert len(out_smi) > 0, f"Could not convert molecule to SMILES {smiles}"
         return out_smi
     except Exception as e:
@@ -86,72 +225,33 @@ def clean_smiles(
 
 
 def get_prf_pipe(
+    morgan_radius: int = 2,
     n_estimators: int = 500,
     random_seed: int = 42,
-    extra_transformers: list = [],
-) -> Pipeline:
-    """Returns a Physiochemical Random Forest scikit-mol pipeline, which can be fit with `pipe.fit(train_smiles, targets)`
+    extra_transformers: Optional[List] = None,
+    stack_chemprop: bool = True,
+    stack_xgb: bool = True,
+    stack_knn: bool = True,
+    stack_elasticnet: bool = True,
+    stack_svr: bool = True,
+    final_estimator: Literal["elasticnet", "hgb", "rf"] = "hgb",
+    global_target_scaling: bool = True,
+):
+    if extra_transformers is None:
+        extra_transformers = []
 
-    Args:
-        n_estimators (int, optional): Number of estimators used in random forest. Defaults to 500.
-        random_seed (int, optional): Random seed for reproducibility. Defaults to 42.
-        extra_transformers (list, optional): List of (name, transformer) tuples to add to the feature union. Defaults to [].
-
-    Raises:
-        TypeError: Unsupported task type specified
-
-    Returns:
-        Pipeline: scikit-mol based training Pipeline for fitting with sklearn
-    """
-    base_models = [
-        (
-            "rf",
-            RandomForestRegressor(
-                n_estimators=n_estimators, random_state=random_seed, n_jobs=-1
-            ),
-        ),
-        (
-            "xgb",
-            XGBRegressor(
-                n_estimators=n_estimators, random_state=random_seed, n_jobs=-1
-            ),
-        ),
-        (
-            "xgbrf",
-            XGBRFRegressor(
-                n_estimators=n_estimators, random_state=random_seed, n_jobs=-1
-            ),
-        ),
-    ]
-    # Meta-regressor
-    meta_model = MLPRegressor(
-        hidden_layer_sizes=(8, 8, 8), random_state=random_seed, early_stopping=True
-    )
-    # Stacking regressor
-    stacking = StackingRegressor(
-        estimators=base_models,
-        final_estimator=meta_model,
-        passthrough=False,
-        n_jobs=-1,
-    )
-    # Final model with target transformation
-    model = TransformedTargetRegressor(
-        regressor=stacking,
-        transformer=QuantileTransformer(output_distribution="normal"),
-    )
-
-    pipe = Pipeline(
+    # base feature pipeline (we will clone this for each base learner)
+    base_feature_pipeline = Pipeline(
         [
-            ("smiles2mol", SmilesToMolTransformer()),
             (
-                "mol2features",
+                "features",
                 FeatureUnion(
                     [
                         (
                             "morgan",
                             MorganFingerprintTransformer(
                                 fpSize=2048,
-                                radius=2,
+                                radius=morgan_radius,
                                 useCounts=True,
                                 n_jobs=-1,
                             ),
@@ -159,12 +259,7 @@ def get_prf_pipe(
                         (
                             "physchem",
                             MolecularDescriptorTransformer(
-                                desc_list=[
-                                    desc
-                                    for desc in MolecularDescriptorTransformer().available_descriptors
-                                    if desc
-                                    != "Ipc"  # Ipc frequently has overflow issues for larger molecules
-                                ],
+                                desc_list=[desc for desc in MolecularDescriptorTransformer().available_descriptors if desc != "Ipc"],
                                 n_jobs=-1,
                             ),
                         ),
@@ -172,15 +267,85 @@ def get_prf_pipe(
                     + extra_transformers
                 ),
             ),
-            # remove zero-variance features. Usually, doesn't really improve accuracy
-            # but makes training faster.
             ("variance_filter", VarianceThreshold(0.0)),
             ("imputer", SimpleImputer(strategy="median")),
-            ("model", model),
+        ]
+    )
+
+    estimators = []
+
+    # helper to create a full pipeline (cloned feature extractor + regressor)
+    def make_base_pipeline(name: str, estimator):
+        fp_clone = clone(base_feature_pipeline)
+        return (name, Pipeline([("feat", fp_clone), (name + "_est", estimator)]))
+
+    # always include RF
+    estimators.append(
+        make_base_pipeline(
+            "rf",
+            RandomForestRegressor(n_estimators=n_estimators, random_state=random_seed, n_jobs=-1),
+        )
+    )
+
+    if stack_xgb:
+        estimators.append(
+            make_base_pipeline(
+                "xgb",
+                XGBRegressor(n_estimators=n_estimators, random_state=random_seed, n_jobs=-1),
+            )
+        )
+
+    if stack_knn:
+        estimators.append(make_base_pipeline("knn", KNeighborsRegressor(n_neighbors=8)))
+
+    if stack_elasticnet:
+        estimators.append(make_base_pipeline("elasticnet", ElasticNet(random_state=random_seed)))
+
+    if stack_svr:
+        estimators.append(make_base_pipeline("svr", make_pipeline(StandardScaler(), SVR())))
+
+    if stack_chemprop:
+        # note - no feature generator! Chemprop handles this internally
+        estimators.append(("chemeleon", ChemeleonRegressor()))
+
+    # final estimator selection
+    if final_estimator == "elasticnet":
+        final_estimator_model = ElasticNet()
+    elif final_estimator == "hgb":
+        final_estimator_model = HistGradientBoostingRegressor(
+            max_depth=3,
+            learning_rate=0.05,
+            max_iter=500,
+            random_state=random_seed,
+        )
+    elif final_estimator == "rf":
+        final_estimator_model = RandomForestRegressor(n_estimators=n_estimators, random_state=random_seed, n_jobs=-1)
+    else:
+        raise ValueError(f"Unknown final_estimator: {final_estimator}")
+
+    model = StackingRegressor(
+        estimators=estimators,
+        final_estimator=final_estimator_model,
+        passthrough=False,
+        n_jobs=1,  # avoid parallel training of chemprop
+        cv=5,
+    )
+
+    pipe = Pipeline(
+        [
+            ("smiles2mol", SmilesToMolTransformer()),
+            ("regressor", model),
         ],
         verbose=True,
     )
-    return pipe
+
+    if global_target_scaling:
+        return TransformedTargetRegressor(
+            regressor=pipe,
+            transformer=QuantileTransformer(n_quantiles=100, output_distribution="normal", random_state=random_seed),
+        )
+    else:
+        return pipe
 
 
 class PreviousModelTransformer:
@@ -192,14 +357,16 @@ class PreviousModelTransformer:
     def _ensure_schema(self):
         """Create cache table if it doesn't exist."""
         with sqlite3.connect(self.cache_db) as conn:
-            conn.execute("""
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS predictions (
                     model_path TEXT,
                     smiles TEXT,
                     prediction REAL,
                     PRIMARY KEY (model_path, smiles)
                 )
-            """)
+            """
+            )
             conn.commit()
 
     def _fetch_cached_predictions(self, conn, model_path, smiles_list):
@@ -217,7 +384,7 @@ class PreviousModelTransformer:
         """Insert new predictions into the cache."""
         conn.executemany(
             "INSERT OR REPLACE INTO predictions (model_path, smiles, prediction) VALUES (?, ?, ?)",
-            [(str(model_path), s, float(p)) for s, p in zip(smiles, preds)]
+            [(str(model_path), s, float(p)) for s, p in zip(smiles, preds)],
         )
         conn.commit()
 
@@ -254,7 +421,6 @@ class PreviousModelTransformer:
                 preds.append(all_preds)
 
         return np.stack(preds, axis=1)
-
 
 
 def parity_plot(
@@ -303,7 +469,7 @@ def parity_plot(
     else:
         raise ValueError(f"Unknown style: {style}")
 
-    mae = round(mean_absolute_error(truth, prediction), 1)
+    mae = round(mean_absolute_error(truth, prediction), 2)
 
     # 1:1 line
     ax.plot(xlim, xlim, "r", linewidth=1)
@@ -352,7 +518,7 @@ def parity_plot(
         textprops=dict(color="w"),
     )
     ax_inset.axis("equal")
-    ax_inset.set_title(f"$\\bf{{±{mae:.1f}}}$ {quantity}", fontsize=10)
+    ax_inset.set_title(f"$\\bf{{±{mae:.2f}}}$ {quantity}", fontsize=10)
 
     plt.tight_layout()
     return fig

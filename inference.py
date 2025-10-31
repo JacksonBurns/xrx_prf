@@ -6,7 +6,7 @@ import pandas as pd
 import joblib
 from pathlib import Path
 
-from common import PreviousModelTransformer, clean_smiles
+from common import clean_smiles
 from tqdm import tqdm
 
 if __name__ == "__main__":
@@ -20,9 +20,7 @@ if __name__ == "__main__":
     if data_cache_f.exists():
         df = pd.read_csv(data_cache_f)
     else:
-        df = pd.read_csv(
-            "hf://datasets/openadmet/openadmet-expansionrx-challenge-test-data-blinded/expansion_data_test_blinded.csv"
-        )
+        df = pd.read_csv("hf://datasets/openadmet/openadmet-expansionrx-challenge-test-data-blinded/expansion_data_test_blinded.csv")
         df.to_csv(data_cache_f, index=False)
 
     test_smiles = list(map(clean_smiles, df["SMILES"]))
@@ -35,7 +33,7 @@ if __name__ == "__main__":
     targets = list(model_dir.glob("Log*"))
     pbar = tqdm(total=len(targets))
     for target in targets:
-        target_name = target.stem
+        target_name = target.stem.replace("_", " ")
         pbar.set_description(f"Predicting '{target_name}'")
         pipe = joblib.load(target / "model.joblib")
         pred = pipe.predict(test_smiles)
@@ -51,5 +49,6 @@ if __name__ == "__main__":
     # timestamped result file
     out_df = pd.DataFrame(out_data)
     out_df.to_csv(
-        model_dir / f"test_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", index=False
+        model_dir / f"test_predictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        index=False,
     )
