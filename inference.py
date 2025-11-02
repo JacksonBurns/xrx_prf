@@ -35,7 +35,7 @@ if __name__ == "__main__":
     for target in targets:
         target_name = target.stem.replace("_", " ")
         pbar.set_description(f"Predicting '{target_name}'")
-        pipe = joblib.load(target / "model.joblib")
+        pipe = joblib.load(target / "final_model.joblib")
         pred = pipe.predict(test_smiles)
         if "Log" in target_name and target_name != "LogD":
             pred = 10**pred

@@ -150,6 +150,8 @@ class ChemeleonRegressor(RegressorMixin, BaseEstimator):
             devices=self.args.devices,
             max_epochs=self.args.epochs,
             callbacks=[StochasticWeightAveraging(0.001, annealing_epochs=4, swa_epoch_start=0.6)],
+            logger=False,
+            enable_checkpointing=False,
         )
         trainer.fit(self.model, train_dataloaders=train_loader)
         return self

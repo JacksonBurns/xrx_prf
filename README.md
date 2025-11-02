@@ -34,5 +34,4 @@ To mimic the progress of a typical drug discovery pipeline, the outputs of previ
 
 ## TODO
 
- - add a chemprop model within the stack (check val to see if it actually improves) using SWE to train on everything
- - train on 100% of the data for final submissions
+ - cache intermediate models to disk to avoid refitting them endlessly during tuning

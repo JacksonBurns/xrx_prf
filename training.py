@@ -1,6 +1,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from astartes.molecules import train_test_split_molecules
 import numpy as np
@@ -18,6 +19,19 @@ from common import (
     parity_plot,
     clean_smiles,
 )
+
+# from previous hpopt runs
+KNOWN_PARAMS = {
+    "LogD": {'morgan_radius': 3, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "KSOL": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "MLM CLint": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "HLM CLint": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
+    "Caco-2 Permeability Papp A>B": {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': False, 'stack_elasticnet': True, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "Caco-2 Permeability Efflux": {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': True},
+    "MPPB": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': True},
+    "MGMB": {'morgan_radius': 4, 'stack_chemprop': False, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "MBPB":{'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
+}
 
 
 # these are in a specific order of which will be used to predict the others
@@ -146,23 +160,28 @@ if __name__ == "__main__":
             sampler="random",  # can change this to possibly improve performance
             return_indices=True,
         )
-        study = optuna.create_study(direction="minimize")
-        study.optimize(
-            lambda trial: train_one(
-                df,
-                train_idxs,
-                val_idxs,
-                target,
-                subdir,
-                extra_transformers,
-                write_output=False,
-                **define_by_run(trial),
-            ),
-            n_trials=TUNING_TRIALS,
-        )
-        with open(subdir / f"optuna_study_{target.replace(' ', '_')}.txt", "w") as f:
-            f.write(f"Best hyperparameters for target {target}: {study.best_params}\n")
-        study.trials_dataframe().to_csv(subdir / f"optuna_study_results_{target.replace(' ', '_')}.csv")
+        if _target in KNOWN_PARAMS:
+            # mock the outcome of the study with known params
+            study = SimpleNamespace()
+            study.best_params = KNOWN_PARAMS[_target]
+        else:
+            study = optuna.create_study(direction="minimize")
+            study.optimize(
+                lambda trial: train_one(
+                    df,
+                    train_idxs,
+                    val_idxs,
+                    target,
+                    subdir,
+                    extra_transformers,
+                    write_output=False,
+                    **define_by_run(trial),
+                ),
+                n_trials=TUNING_TRIALS,
+            )
+            with open(subdir / f"optuna_study_{target.replace(' ', '_')}.txt", "w") as f:
+                f.write(f"Best hyperparameters for target {target}: {study.best_params}\n")
+            study.trials_dataframe().to_csv(subdir / f"optuna_study_results_{target.replace(' ', '_')}.csv")
 
         # for reference, train and save the validation model with the optimal settings
         train_one(
