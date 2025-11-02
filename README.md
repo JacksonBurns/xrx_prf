@@ -34,4 +34,4 @@ To mimic the progress of a typical drug discovery pipeline, the outputs of previ
 
 ## TODO
 
- - cache intermediate models to disk to avoid refitting them endlessly during tuning
+ - cache intermediate models to disk to avoid refitting them endlessly during tuning __or__ expand the `train_one` function to accept kwargs for each model to allow further optimization
