@@ -228,6 +228,7 @@ def clean_smiles(
 
 def get_prf_pipe(
     morgan_radius: int = 2,
+    morgan_size: int = 2048,
     n_estimators: int = 500,
     random_seed: int = 42,
     extra_transformers: Optional[List] = None,
@@ -237,7 +238,16 @@ def get_prf_pipe(
     stack_elasticnet: bool = True,
     stack_svr: bool = True,
     final_estimator: Literal["elasticnet", "hgb", "rf"] = "hgb",
+    hgb_max_depth: int = 3,
+    hgb_learning_rate: float = 0.05,
     global_target_scaling: bool = True,
+    xgb_max_depth: int = 6,
+    xgb_learning_rate: float = 0.1,
+    knn_n_neighbors: int = 8,
+    svr_C: float = 1.0,
+    svr_gamma: str = "scale",
+    chemeleon_ffn_hidden_dim: int = 2_048,
+    chemeleon_ffn_num_layers: int = 1,
 ):
     if extra_transformers is None:
         extra_transformers = []
@@ -252,7 +262,7 @@ def get_prf_pipe(
                         (
                             "morgan",
                             MorganFingerprintTransformer(
-                                fpSize=2048,
+                                fpSize=morgan_size,
                                 radius=morgan_radius,
                                 useCounts=True,
                                 n_jobs=-1,
@@ -293,30 +303,30 @@ def get_prf_pipe(
         estimators.append(
             make_base_pipeline(
                 "xgb",
-                XGBRegressor(n_estimators=n_estimators, random_state=random_seed, n_jobs=-1),
+                XGBRegressor(n_estimators=n_estimators, random_state=random_seed, n_jobs=-1, max_depth=xgb_max_depth, learning_rate=xgb_learning_rate),
             )
         )
 
     if stack_knn:
-        estimators.append(make_base_pipeline("knn", KNeighborsRegressor(n_neighbors=8)))
+        estimators.append(make_base_pipeline("knn", KNeighborsRegressor(n_neighbors=knn_n_neighbors)))
 
     if stack_elasticnet:
         estimators.append(make_base_pipeline("elasticnet", ElasticNet(random_state=random_seed)))
 
     if stack_svr:
-        estimators.append(make_base_pipeline("svr", make_pipeline(StandardScaler(), SVR())))
+        estimators.append(make_base_pipeline("svr", make_pipeline(StandardScaler(), SVR(C=svr_C, gamma=svr_gamma))))
 
     if stack_chemprop:
         # note - no feature generator! Chemprop handles this internally
-        estimators.append(("chemeleon", ChemeleonRegressor()))
+        estimators.append(("chemeleon", ChemeleonRegressor(ffn_hidden_dim=chemeleon_ffn_hidden_dim, ffn_num_layers=chemeleon_ffn_num_layers)))
 
     # final estimator selection
     if final_estimator == "elasticnet":
         final_estimator_model = ElasticNet()
     elif final_estimator == "hgb":
         final_estimator_model = HistGradientBoostingRegressor(
-            max_depth=3,
-            learning_rate=0.05,
+            max_depth=hgb_max_depth,
+            learning_rate=hgb_learning_rate,
             max_iter=500,
             random_state=random_seed,
         )

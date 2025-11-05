@@ -3,13 +3,12 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from astartes.molecules import train_test_split_molecules
 import numpy as np
 import pandas as pd
 import joblib
 import matplotlib
 import optuna
-from sklearn.metrics import root_mean_squared_error
+from sklearn.metrics import mean_absolute_error
 
 matplotlib.use("Agg")
 
@@ -21,16 +20,19 @@ from common import (
 )
 
 # from previous hpopt runs
-KNOWN_PARAMS = {
-    "LogD": {'morgan_radius': 3, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
-    "KSOL": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
-    "MLM CLint": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
-    "HLM CLint": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
+KNOWN_PARAMS = {}
+
+# for my initial interpolation efforts, these were the best settings
+{
+    "LogD":                         {'morgan_radius': 3, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "KSOL":                         {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "MLM CLint":                    {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "HLM CLint":                    {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': True, 'stack_elasticnet': True, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
     "Caco-2 Permeability Papp A>B": {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': True, 'stack_knn': False, 'stack_elasticnet': True, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
-    "Caco-2 Permeability Efflux": {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': True},
-    "MPPB": {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': True},
-    "MGMB": {'morgan_radius': 4, 'stack_chemprop': False, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
-    "MBPB":{'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
+    "Caco-2 Permeability Efflux":   {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': True},
+    "MPPB":                         {'morgan_radius': 4, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': False, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'hgb', 'global_target_scaling': True},
+    "MGMB":                         {'morgan_radius': 4, 'stack_chemprop': False, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': False, 'final_estimator': 'hgb', 'global_target_scaling': False},
+    "MBPB":                         {'morgan_radius': 2, 'stack_chemprop': True, 'stack_xgb': False, 'stack_knn': True, 'stack_elasticnet': False, 'stack_svr': True, 'final_estimator': 'rf', 'global_target_scaling': False},
 }
 
 
@@ -48,13 +50,13 @@ TARGETS = [
 ]
 SMILES_COL = "SMILES"
 
-TUNING_MAX_SAMPLES = 1000  # limit number of samples for hyperparameter tuning for speed
 TUNING_TRIALS = 64  # number of optuna trials for hyperparameter tuning
 
 
 def define_by_run(trial):
-    return dict(
+    params = dict(
         morgan_radius=trial.suggest_categorical("morgan_radius", [2, 3, 4]),
+        morgan_size=trial.suggest_categorical("morgan_size", [1024, 2048, 4096]),
         stack_chemprop=trial.suggest_categorical("stack_chemprop", [True, False]),
         stack_xgb=trial.suggest_categorical("stack_xgb", [True, False]),
         stack_knn=trial.suggest_categorical("stack_knn", [True, False]),
@@ -63,6 +65,41 @@ def define_by_run(trial):
         final_estimator=trial.suggest_categorical("final_estimator", ["elasticnet", "hgb", "rf"]),
         global_target_scaling=trial.suggest_categorical("global_target_scaling", [True, False]),
     )
+
+    if params["final_estimator"] == "hgb":
+        params["hgb_max_depth"] = trial.suggest_int("hgb_max_depth", 3, 10)
+        params["hgb_learning_rate"] = trial.suggest_categorical("hgb_learning_rate", [0.001, 0.01, 0.05, 0.1])
+    else:
+        params["hgb_max_depth"] = 3
+        params["hgb_learning_rate"] = 0.05
+
+    # Conditionally suggest hyperparameters for stacked models
+    if params["stack_xgb"]:
+        params["xgb_max_depth"] = trial.suggest_int("xgb_max_depth", 3, 10)
+        params["xgb_learning_rate"] = trial.suggest_float("xgb_learning_rate", 1e-3, 0.3, log=True)
+    else:
+        # Provide a default value if not stacked, though common.py uses its own defaults
+        # This is primarily to avoid Optuna errors if the parameter isn't defined.
+        params["xgb_max_depth"] = 6
+        params["xgb_learning_rate"] = 0.1
+
+    if params["stack_knn"]:
+        params["knn_n_neighbors"] = trial.suggest_int("knn_n_neighbors", 3, 30)
+    else:
+        params["knn_n_neighbors"] = 8
+
+    if params["stack_svr"]:
+        params["svr_C"] = trial.suggest_float("svr_C", 1e-1, 100.0, log=True)
+        params["svr_gamma"] = trial.suggest_categorical("svr_gamma", ["scale", "auto"])
+    else:
+        params["svr_C"] = 1.0
+        params["svr_gamma"] = "scale"
+    
+    if params["stack_chemprop"]:
+        params["chemeleon_ffn_hidden_dim"] = trial.suggest_int("chemeleon_ffn_hidden_dim", 400, 3000, 200)
+        params["chemeleon_ffn_num_layers"] = trial.suggest_int("chemeleon_ffn_num_layers", 0, 3)
+
+    return params
 
 
 def train_one(
@@ -94,7 +131,7 @@ def train_one(
             quantity=target,
         )
         fig.savefig(subdir / "validation_parity.png", dpi=300)
-    return root_mean_squared_error(val_df[f"true_{target}"], val_df[f"pred_{target}"])
+    return mean_absolute_error(val_df[f"true_{target}"], val_df[f"pred_{target}"])
 
 
 if __name__ == "__main__":
@@ -152,14 +189,12 @@ if __name__ == "__main__":
             ]
 
         # start by hyperparameter optimizing the model
-        *_, train_idxs, val_idxs = train_test_split_molecules(
-            df[SMILES_COL].to_numpy(),
-            train_size=0.8,
-            test_size=0.2,
-            random_state=42,
-            sampler="random",  # can change this to possibly improve performance
-            return_indices=True,
-        )
+        # perform roughly time-based splitting (roughly, because it's based on the molecule label)
+        df = df.sort_values("Molecule Name")  # already sorted, but just in case
+        _cutoff = int(df.shape[0] * 0.80)
+        train_idxs = np.arange(_cutoff)
+        val_idxs = np.arange(_cutoff, df.shape[0])
+
         if _target in KNOWN_PARAMS:
             # mock the outcome of the study with known params
             study = SimpleNamespace()
