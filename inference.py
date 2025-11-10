@@ -30,10 +30,10 @@ if __name__ == "__main__":
         "SMILES": df["SMILES"],  # original smiles for output, cleaned ones for inference
     }
 
-    targets = list(model_dir.glob("Log*"))
+    targets = list(filter(lambda p: p.stem.endswith("final"), model_dir.glob("Log*")))
     pbar = tqdm(total=len(targets))
     for target in targets:
-        target_name = target.stem.replace("_", " ")
+        target_name = target.stem[:-6].replace("_", " ")  # cutoff layer name, remove underscores
         pbar.set_description(f"Predicting '{target_name}'")
         pipe = joblib.load(target / "final_model.joblib")
         pred = pipe.predict(test_smiles)
