@@ -31,7 +31,3 @@ From there you can train the models with `python training.py /path/to/output/dir
 This approach uses the 'Physiochemical Random Forest' shared by BASF [here](https://github.com/JacksonBurns/chemeleon/blob/51e028a77a3cb4de87ff1e75a7ed18d4372606f4/models/rf_morgan_physchem/evaluate.py) as a starting point, swapping out a plain random forest for a more complicated hybrid model (see [`common.py`](./common.py)).
 
 To mimic the progress of a typical drug discovery pipeline, the outputs of previous models are used as inputs for subsequent models (i.e., after training a LogD model, we use predicted LogD as an input feature to predict solubility).
-
-## TODO
-
- - cache intermediate models to disk to avoid refitting them endlessly during tuning __or__ expand the `train_one` function to accept kwargs for each model to allow further optimization
